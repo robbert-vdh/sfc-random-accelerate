@@ -30,11 +30,10 @@ module Data.Array.Accelerate.System.Random.SFC (
   runRandom, evalRandom, evalRandomT,
   RNG(random),
 
-  create, createWith,
-
-  Uniform(..),
+  RandomGen(create, createWith),
   SFC64,
 
+  Uniform(..),
 ) where
 
 import Data.Array.Accelerate                                        as A
@@ -72,6 +71,8 @@ evalRandomT :: (Monad m) => t -> RandomT m t a -> m a
 evalRandomT gen r = evalStateT (runRandomT r) gen
 
 
+-- | The class of types that can be used to generate random data with.
+--
 class RNG t where
   type Output t a
 
@@ -81,16 +82,70 @@ class RNG t where
   --
   random :: (Uniform a, Monad m) => RandomT m t (Output t a)
 
-instance Shape sh => RNG (Acc (Array sh SFC64)) where
-  type Output (Acc (Array sh SFC64)) a = Acc (Array sh a)
+instance (Shape sh, RandomGen g) => RNG (Acc (Array sh g)) where
+  type Output (Acc (Array sh g)) a = Acc (Array sh a)
 
   random = RandomT $ state (A.unzip . A.map uniform)
 
-instance RNG (Exp SFC64) where
-  type Output (Exp SFC64) a = Exp a
+instance RandomGen g => RNG (Exp g) where
+  type Output (Exp g) a = Exp a
 
   random = RandomT $ state (unlift . uniform)
 
+
+first :: (Elt a, Elt b, Elt c) => (Exp a -> Exp b) -> Exp (a, c) -> Exp (b, c)
+first f (T2 a b) = T2 (f a) b
+
+
+-- * Pseudo-random number generators
+
+-- | An interface to pseudo-random number generators.
+--
+class Elt g => RandomGen g where
+  {-# MINIMAL create,createWith,(genWord32|genWord64) #-}
+
+  -- | The type of the initial seed used while creating the PRNG.
+  --
+  type Seed g
+
+  -- | Create a new generator state using default seeds (the array index).
+  --
+  -- You'll probably get better random numbers by using 'createWith' and
+  -- seeding the initial state from a better source of entropy. For example,
+  -- we can use the 'mwc-random-accelerate' package to generate the seed
+  -- vector using the system's source of random numbers:
+  --
+  -- > gen <- createWith . use <$> MWC.randomArray MWC.uniform (Z :. 100)
+  --
+  create :: Shape sh => Exp sh -> Acc (Array sh g)
+
+  -- | Create a new generator state using the given seed vector.
+  --
+  createWith
+      :: Shape sh
+      => Acc (Array sh (Seed g))
+      -> Acc (Array sh g)
+
+  -- | Generate a uniformly distributed 'Word32'.
+  --
+  genWord32 :: Exp g -> Exp (Word32, g)
+  genWord32 = first A.fromIntegral . genWord64
+
+  -- | Generate a uniformly distributed 'Word64'.
+  --
+  genWord64 :: Exp g -> Exp (Word64, g)
+  genWord64 g =
+      let T2 l32 g'  = genWord32 g
+          T2 u32 g'' = genWord32 g'
+      in  T2 ((A.fromIntegral u32 `unsafeShiftL` 32) .|. A.fromIntegral l32) g''
+
+
+-- ** SFC64
+--
+-- The Small Fast Carry RNG (64-bit)
+--
+-- Stolen from PractRand v0.95.
+--
 
 data SFC a = SFC64_ a a a a
   deriving (Generic, Elt)
@@ -98,97 +153,79 @@ data SFC a = SFC64_ a a a a
 pattern SFC :: Elt a => Exp a -> Exp a -> Exp a -> Exp a -> Exp (SFC a)
 pattern SFC a b c counter = Pattern (a, b, c, counter)
 {-# COMPLETE SFC #-}
-
 type SFC64 = SFC Word64
 
--- | The Small Fast Carry RNG (64-bit)
---
--- Stolen from PractRand v0.95.
---
-sfc64 :: Exp SFC64 -> Exp (Word64, SFC64)
-sfc64 (SFC a b c counter) =
-  let tmp      = a + b + counter
-      counter' = counter + 1
-      a'       = b `xor` (b `unsafeShiftR` 11)
-      b'       = c +     (c `unsafeShiftL` 3)
-      c'       = ((c `unsafeShiftL` 24) .|. (c `unsafeShiftR` (64-24))) + tmp
-   in
-   T2 tmp (SFC a' b' c' counter')
+instance RandomGen SFC64 where
+  type Seed SFC64 = (Word64, Word64, Word64)
 
--- | Create a new generator state using default seeds (the array index).
---
--- You'll probably get better random numbers by using 'createWith' and
--- seeding the initial state from a better source of entropy. For example,
--- we can use the 'mwc-random-accelerate' package to generate the seed
--- vector using the system's source of random numbers:
---
--- > gen <- createWith . use <$> MWC.randomArray MWC.uniform (Z :. 100)
---
-create :: Shape sh => Exp sh -> Acc (Array sh SFC64)
-create sh = A.map seed_fast $ enumFromN sh 0
+  create sh = A.map seedFast $ enumFromN sh 0
+   where
+    seedFast :: Exp Word64 -> Exp SFC64
+    seedFast s = A.snd $ while
+      (\(T2 i _) -> i A.< 8)
+      (\(T2 i g) -> let T2 _ g' = genWord64 g in T2 (i + 1) g')
+      (T2 (0 :: Exp Int) (SFC s s s 1))
 
-seed_fast :: Exp Word64 -> Exp SFC64
-seed_fast s
-  = A.snd
-  $ while (\(T2 i _) -> i A.< 8)
-          (\(T2 i g) -> let T2 _ g' = sfc64 g in T2 (i+1) g')
-          (T2 (0 :: Exp Int) (SFC s s s 1))
+  createWith = A.map (\(T3 a b c) -> seed a b c)
+   where
+    seed :: Exp Word64 -> Exp Word64 -> Exp Word64 -> Exp SFC64
+    seed a b c = A.snd $ while
+      (\(T2 i _) -> i A.< 18)
+      (\(T2 i g) -> let T2 _ g' = genWord64 g in T2 (i + 1) g')
+      (T2 (0 :: Exp Int) (SFC a b c 1))
+
+  genWord64 (SFC a b c counter) =
+    let tmp      = a + b + counter
+        counter' = counter + 1
+        a'       = b `xor` (b `unsafeShiftR` 11)
+        b'       = c + (c `unsafeShiftL` 3)
+        c' = ((c `unsafeShiftL` 24) .|. (c `unsafeShiftR` (64 - 24))) + tmp
+    in  T2 tmp (SFC a' b' c' counter')
 
 
--- | Create a new generator state using the given seed vector
---
-createWith
-    :: Shape sh
-    => Acc (Array sh (Word64, Word64, Word64))
-    -> Acc (Array sh SFC64)
-createWith = A.map (\(T3 a b c) -> seed a b c)
-
-seed :: Exp Word64 -> Exp Word64 -> Exp Word64 -> Exp SFC64
-seed a b c
-  = A.snd
-  $ while (\(T2 i _) -> i A.< 18)
-          (\(T2 i g) -> let T2 _ g' = sfc64 g in T2 (i+1) g')
-          (T2 (0 :: Exp Int) (SFC a b c 1))
-
-
-first :: (Elt a, Elt b, Elt c) => (Exp a -> Exp b) -> Exp (a, c) -> Exp (b, c)
-first f (T2 a b) = T2 (f a) b
+-- * Distributions
 
 -- | The class of types for which we can generate random variates. Integral
 -- variates are generated in the full range, floating point variates are in
 -- the range [0,1].
 --
 class Elt a => Uniform a where
-  uniform :: Exp SFC64 -> Exp (a, SFC64)
+  uniform :: RandomGen g => Exp g -> Exp (a, g)
 
-instance Uniform Bool   where uniform = first A.even . sfc64
-instance Uniform Int    where uniform = first A.fromIntegral . sfc64
-instance Uniform Int8   where uniform = first A.fromIntegral . sfc64
-instance Uniform Int16  where uniform = first A.fromIntegral . sfc64
-instance Uniform Int32  where uniform = first A.fromIntegral . sfc64
-instance Uniform Int64  where uniform = first A.fromIntegral . sfc64
-instance Uniform Word   where uniform = first A.fromIntegral . sfc64
-instance Uniform Word8  where uniform = first A.fromIntegral . sfc64
-instance Uniform Word16 where uniform = first A.fromIntegral . sfc64
-instance Uniform Word32 where uniform = first A.fromIntegral . sfc64
-instance Uniform Word64 where uniform = sfc64
+-- TODO: Are redundant @A.fromIntegrals@ optimized away? For example:
+--
+--       > A.fromIntegral (A.fromIntegral (x :: Exp Word32) :: Exp Word16) :: Exp Word8
+instance Uniform Bool   where uniform = first A.even . genWord32
+-- TODO: How does Accelerate handle word sizes in PTX code? Can we always assume
+--       the word size is 64 bits?
+instance Uniform Int    where uniform = first A.fromIntegral . genWord64
+instance Uniform Int8   where uniform = first A.fromIntegral . genWord32
+instance Uniform Int16  where uniform = first A.fromIntegral . genWord32
+instance Uniform Int32  where uniform = first A.fromIntegral . genWord32
+instance Uniform Int64  where uniform = first A.fromIntegral . genWord64
+-- TODO: Same as the above
+instance Uniform Word   where uniform = first A.fromIntegral . genWord64
+instance Uniform Word8  where uniform = first A.fromIntegral . genWord32
+instance Uniform Word16 where uniform = first A.fromIntegral . genWord32
+instance Uniform Word32 where uniform = genWord32
+instance Uniform Word64 where uniform = genWord64
 
 instance Uniform Half where
-  uniform = first toFloating . uniform @Double
+  uniform = first toFloating . uniform @Float
 
 instance Uniform Float where
   uniform s =
-    let cvt :: Exp Word64 -> Exp Float
-        cvt v = A.fromIntegral v * (1 / A.fromIntegral (maxBound :: Exp Word64))
+    let cvt :: Exp Word32 -> Exp Float
+        cvt v = A.fromIntegral v * (1 / A.fromIntegral (maxBound :: Exp Word32))
      in
-     first cvt (sfc64 s)
+     first cvt (genWord32 s)
 
 instance Uniform Double where
   uniform s =
     let cvt :: Exp Word64 -> Exp Double
         cvt v = A.fromIntegral v * (1 / A.fromIntegral (maxBound :: Exp Word64))
      in
-     first cvt (sfc64 s)
+     first cvt (genWord64 s)
 
 instance Uniform a => Uniform (Complex a) where
   uniform s0 =
@@ -236,4 +273,3 @@ runQ $ do
            |]
   --
   concat <$> mapM mkTup [2..16]
-
