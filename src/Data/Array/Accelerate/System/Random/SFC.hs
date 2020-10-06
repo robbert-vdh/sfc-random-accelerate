@@ -31,7 +31,7 @@ module Data.Array.Accelerate.System.Random.SFC (
   RNG(random),
 
   RandomGen(create, createWith),
-  SFC64,
+  SFC64, SFC32,
 
   Uniform(..),
 ) where
@@ -147,12 +147,13 @@ class Elt g => RandomGen g where
 -- Stolen from PractRand v0.95.
 --
 
-data SFC a = SFC64_ a a a a
+data SFC a = SFC_ a a a a
   deriving (Generic, Elt)
 
 pattern SFC :: Elt a => Exp a -> Exp a -> Exp a -> Exp a -> Exp (SFC a)
 pattern SFC a b c counter = Pattern (a, b, c, counter)
 {-# COMPLETE SFC #-}
+
 type SFC64 = SFC Word64
 
 instance RandomGen SFC64 where
@@ -180,6 +181,41 @@ instance RandomGen SFC64 where
         a'       = b `xor` (b `unsafeShiftR` 11)
         b'       = c + (c `unsafeShiftL` 3)
         c' = ((c `unsafeShiftL` 24) .|. (c `unsafeShiftR` (64 - 24))) + tmp
+    in  T2 tmp (SFC a' b' c' counter')
+
+
+-- ** SFC32
+--
+-- Same as 'SFC64', but using 32-bit integers for its internal state.
+--
+
+type SFC32 = SFC Word32
+
+instance RandomGen SFC32 where
+  type Seed SFC32 = (Word32, Word32, Word32)
+
+  create sh = A.map seedFast $ enumFromN sh 0
+   where
+    seedFast :: Exp Word64 -> Exp SFC32
+    seedFast s = A.snd $ while
+      (\(T2 i _) -> i A.< 8)
+      (\(T2 i g) -> let T2 _ g' = genWord32 g in T2 (i + 1) g')
+      (T2 (0 :: Exp Int) (SFC 0 (A.fromIntegral s) (A.fromIntegral $ s `unsafeShiftR` 32) 1))
+
+  createWith = A.map (\(T3 a b c) -> seed a b c)
+   where
+    seed :: Exp Word32 -> Exp Word32 -> Exp Word32 -> Exp SFC32
+    seed a b c = A.snd $ while
+      (\(T2 i _) -> i A.< 15)
+      (\(T2 i g) -> let T2 _ g' = genWord32 g in T2 (i + 1) g')
+      (T2 (0 :: Exp Int) (SFC a b c 1))
+
+  genWord32 (SFC a b c counter) =
+    let tmp      = a + b + counter
+        counter' = counter + 1
+        a'       = b `xor` (b `unsafeShiftR` 9)
+        b'       = c + (c `unsafeShiftL` 3)
+        c' = ((c `unsafeShiftL` 21) .|. (c `unsafeShiftR` (32 - 21))) + tmp
     in  T2 tmp (SFC a' b' c' counter')
 
 
