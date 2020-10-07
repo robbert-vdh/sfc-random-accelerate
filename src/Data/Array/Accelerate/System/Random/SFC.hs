@@ -32,6 +32,7 @@ module Data.Array.Accelerate.System.Random.SFC (
 
   RandomGen(create, createWith),
   SFC64, SFC32,
+  XorShift32,
 
   Uniform(..),
 ) where
@@ -217,6 +218,35 @@ instance RandomGen SFC32 where
         b'       = c + (c `unsafeShiftL` 3)
         c' = ((c `unsafeShiftL` 21) .|. (c `unsafeShiftR` (32 - 21))) + tmp
     in  T2 tmp (SFC a' b' c' counter')
+
+
+-- ** Xorshift
+--
+-- A 32-bit xorshift pseudo-random number generator. The implementation is
+-- faster than the SFC family of PRNGs while using less memory, but the
+-- generated numbers will be of much lower quality.
+
+data XorShift a = XorShift_ a
+  deriving (Generic, Elt)
+
+pattern XorShift :: Elt a => Exp a -> Exp (XorShift a)
+pattern XorShift state = Pattern state
+{-# COMPLETE XorShift #-}
+
+type XorShift32 = XorShift Word32
+
+instance RandomGen XorShift32 where
+  type Seed XorShift32 = Word32
+
+  create sh = A.map XorShift $ enumFromN sh 0
+
+  createWith = A.map XorShift
+
+  genWord32 (XorShift state) =
+    let state'    = state `xor` (state `unsafeShiftL` 13)
+        state''   = state' `xor` (state' `unsafeShiftR` 17)
+        nextState = state'' `xor` (state'' `unsafeShiftL` 5)
+    in  T2 nextState (XorShift nextState)
 
 
 -- * Distributions
