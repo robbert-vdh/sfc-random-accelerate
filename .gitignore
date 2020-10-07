@@ -1,5 +1,5 @@
 .stack-work/
+dist-newstyle/
 *~
-/.stack-work
 *.lock
 /stack.yaml
